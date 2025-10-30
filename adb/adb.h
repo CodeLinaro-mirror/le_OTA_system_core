@@ -22,11 +22,10 @@
 
 #include <string>
 
-#include <android-base/macros.h>
+#include <base/macros.h>
 
 #include "adb_trace.h"
 #include "fdevent.h"
-#include "socket.h"
 
 constexpr size_t MAX_PAYLOAD_V1 = 4 * 1024;
 constexpr size_t MAX_PAYLOAD_V2 = 256 * 1024;
@@ -50,7 +49,7 @@ constexpr size_t MAX_PAYLOAD = MAX_PAYLOAD_V2;
 std::string adb_version();
 
 // Increment this when we want to force users to start a new adb server.
-#define ADB_SERVER_VERSION 36
+#define ADB_SERVER_VERSION 34
 
 class atransport;
 struct usb_handle;
@@ -75,6 +74,80 @@ struct apacket
     unsigned char data[MAX_PAYLOAD];
 };
 
+/* An asocket represents one half of a connection between a local and
+** remote entity.  A local asocket is bound to a file descriptor.  A
+** remote asocket is bound to the protocol engine.
+*/
+struct asocket {
+        /* chain pointers for the local/remote list of
+        ** asockets that this asocket lives in
+        */
+    asocket *next;
+    asocket *prev;
+
+        /* the unique identifier for this asocket
+        */
+    unsigned id;
+
+        /* flag: set when the socket's peer has closed
+        ** but packets are still queued for delivery
+        */
+    int    closing;
+
+        /* flag: quit adbd when both ends close the
+        ** local service socket
+        */
+    int    exit_on_close;
+
+        /* the asocket we are connected to
+        */
+
+    asocket *peer;
+
+        /* For local asockets, the fde is used to bind
+        ** us to our fd event system.  For remote asockets
+        ** these fields are not used.
+        */
+    fdevent fde;
+    int fd;
+
+        /* queue of apackets waiting to be written
+        */
+    apacket *pkt_first;
+    apacket *pkt_last;
+
+        /* enqueue is called by our peer when it has data
+        ** for us.  It should return 0 if we can accept more
+        ** data or 1 if not.  If we return 1, we must call
+        ** peer->ready() when we once again are ready to
+        ** receive data.
+        */
+    int (*enqueue)(asocket *s, apacket *pkt);
+
+        /* ready is called by the peer when it is ready for
+        ** us to send data via enqueue again
+        */
+    void (*ready)(asocket *s);
+
+        /* shutdown is called by the peer before it goes away.
+        ** the socket should not do any further calls on its peer.
+        ** Always followed by a call to close. Optional, i.e. can be NULL.
+        */
+    void (*shutdown)(asocket *s);
+
+        /* close is called by the peer when it has gone away.
+        ** we are not allowed to make any further calls on the
+        ** peer once our close method is called.
+        */
+    void (*close)(asocket *s);
+
+        /* A socket is bound to atransport */
+    atransport *transport;
+
+    size_t get_max_payload() const;
+};
+
+
 /* the adisconnect structure is used to record a callback that
 ** will be called whenever a transport is disconnected (e.g. by the user)
 ** this should be used to cleanup objects that depend on the
@@ -84,6 +157,8 @@ struct  adisconnect
 {
     void        (*func)(void*  opaque, atransport*  t);
     void*         opaque;
+    adisconnect*  next;
+    adisconnect*  prev;
 };
 
 
@@ -142,16 +217,27 @@ struct alistener
 
 void print_packet(const char *label, apacket *p);
 
-// These use the system (v)fprintf, not the adb prefixed ones defined in sysdeps.h, so they
-// shouldn't be tagged with ADB_FORMAT_ARCHETYPE.
-void fatal(const char* fmt, ...) __attribute__((noreturn, format(__printf__, 1, 2)));
-void fatal_errno(const char* fmt, ...) __attribute__((noreturn, format(__printf__, 1, 2)));
+asocket *find_local_socket(unsigned local_id, unsigned remote_id);
+void install_local_socket(asocket *s);
+void remove_socket(asocket *s);
+void close_all_sockets(atransport *t);
+
+asocket *create_local_socket(int fd);
+asocket *create_local_service_socket(const char* destination,
+                                     const atransport* transport);
+
+asocket *create_remote_socket(unsigned id, atransport *t);
+void connect_to_remote(asocket *s, const char *destination);
+void connect_to_smartsocket(asocket *s);
+
+void fatal(const char *fmt, ...);
+void fatal_errno(const char *fmt, ...);
 
 void handle_packet(apacket *p, atransport *t);
 
 void get_my_path(char *s, size_t maxLen);
 int launch_server(int server_port);
-int adb_server_main(int is_daemon, int server_port, int ack_reply_fd);
+int adb_main(int is_daemon, int server_port);
 
 /* initialize a transport object's func pointers and state */
 #if ADB_HOST
@@ -160,10 +246,8 @@ int get_available_local_transport_index();
 int  init_socket_transport(atransport *t, int s, int port, int local);
 void init_usb_transport(atransport *t, usb_handle *usb, ConnectionState state);
 
-std::string getEmulatorSerialString(int console_port);
 #if ADB_HOST
 atransport* find_emulator_transport_by_adb_port(int adb_port);
-atransport* find_emulator_transport_by_console_port(int console_port);
 #endif
 
 int service_to_fd(const char* name, const atransport* transport);
@@ -183,6 +267,7 @@ int handle_forward_request(const char* service, TransportType type, const char* 
 #if !ADB_HOST
 void framebuffer_service(int fd, void *cookie);
 void set_verity_enabled_state_service(int fd, void* cookie);
+void set_verity_enabled_state_service_le(int fd, void* cookie);
 #endif
 
 /* packet allocator */
@@ -213,20 +298,22 @@ void put_apacket(apacket *p);
 
 
 void local_init(int port);
-void local_connect(int port);
-int  local_connect_arbitrary_ports(int console_port, int adb_port, std::string* error);
+int  local_connect(int  port);
+int  local_connect_arbitrary_ports(int console_port, int adb_port);
 
-// USB host/client interface.
+/* usb host/client interface */
 void usb_init();
 int usb_write(usb_handle *h, const void *data, int len);
 int usb_read(usb_handle *h, void *data, int len);
 int usb_close(usb_handle *h);
 void usb_kick(usb_handle *h);
 
-// USB device detection.
+/* used for USB device detection */
 #if ADB_HOST
 int is_adb_interface(int vid, int pid, int usb_class, int usb_subclass, int usb_protocol);
 #endif
+
+int adb_commandline(int argc, const char **argv);
 
 ConnectionState connection_state(atransport *t);
 
@@ -235,6 +322,10 @@ extern const char* adb_device_banner;
 #if !ADB_HOST
 extern int SHELL_EXIT_NOTIFY_FD;
 #endif // !ADB_HOST
+#if !ADB_HOST
+#define ADB_MAX_BUF_LEN 80
+extern bool adb_use_pcie;
+#endif
 
 #define CHUNK_SIZE (64*1024)
 
@@ -247,7 +338,15 @@ extern int SHELL_EXIT_NOTIFY_FD;
 #define USB_FFS_ADB_EP0   USB_FFS_ADB_EP(ep0)
 #define USB_FFS_ADB_OUT   USB_FFS_ADB_EP(ep1)
 #define USB_FFS_ADB_IN    USB_FFS_ADB_EP(ep2)
+
+#if ALLOW_ADBD_ROOT
+#define ROOT_MAGIC "#ROOT###"
+#define ROOT_MAGIC_SIZE 8
 #endif
+#endif
+
+/* Differentiating macro for the targets which supports adb non root */
+#define _ALLOW_ADB_NONROOT_
 
 int handle_host_request(const char* service, TransportType type, const char* serial, int reply_fd, asocket *s);
 

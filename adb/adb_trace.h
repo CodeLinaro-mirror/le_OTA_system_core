@@ -17,8 +17,8 @@
 #ifndef __ADB_TRACE_H
 #define __ADB_TRACE_H
 
-#include <android-base/logging.h>
-#include <android-base/stringprintf.h>
+#include <base/logging.h>
+#include <base/stringprintf.h>
 
 /* IMPORTANT: if you change the following list, don't
  * forget to update the corresponding 'tags' table in
@@ -38,7 +38,22 @@ enum AdbTrace {
     AUTH,
     FDEVENT,
     SHELL
-};
+} ;
+
+#if !ADB_HOST
+/*
+ * When running inside the emulator, guest's adbd can connect to 'adb-debug'
+ * qemud service that can display adb trace messages (on condition that emulator
+ * has been started with '-debug adb' option).
+ */
+
+/* Delivers a trace message to the emulator via QEMU pipe. */
+void adb_qemu_trace(const char* fmt, ...);
+/* Macro to use to send ADB trace messages to the emulator. */
+#define DQ(...)    adb_qemu_trace(__VA_ARGS__)
+#else
+#define DQ(...) ((void)0)
+#endif  /* !ADB_HOST */
 
 #define VLOG_IS_ON(TAG) \
     ((adb_trace_mask & (1 << TAG)) != 0)
